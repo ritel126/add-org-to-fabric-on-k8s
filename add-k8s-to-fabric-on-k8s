@@ -1,0 +1,66 @@
+在集群master上执行fabric-on-kubernets脚本
+cd fabric-on-kubernetes-master
+./generateALL.sh
+python3 transform/run.py
+察看fabric创建情况
+kubectl get pod --all-namespaces
+然后进入org1的cli创建通道并执行链码
+peer channel create -o orderer0.orgorderer1:7050 -c mychannel -f ./channel-artifacts/channel.tx
+cp mychannel.block channel-artifacts
+peer channel join -b channel-artifacts/mychannel.block
+peer channel update -o orderer0.orgorderer1:7050 -c mychannel -f./channel-artifacts/Org1MSPanchors.tx
+peer chaincode install -n mycc -v 1.0 -p github.com/hyperledger/fabric/peer/channel-artifacts/chaincode
+peer chaincode instantiate -o orderer0.orgorderer1:7050 \
+                             -C mychannel -n mycc -v 1.0 \
+                             -c '{"Args":["init","a", "100", "b","200"]}' \
+                             -P "OR ('Org1MSP.peer')"
+peer chaincode query -C mychannel -n mycc -c '{"Args":["query","a"]}'
+peer chaincode invoke -o orderer0.orgorderer1:7050\
+                        -C mychannel -n mycc \
+                        --peerAddresses peer0.org1:7051 \
+                        -c '{"Args":["invoke","a","b","10"]}'
+peer chaincode query -C mychannel -n mycc -c '{"Args":["query","a"]}'
+进入org2的cli加入通道并执行链码
+peer channel join -b channel-artifacts/mychannel.block
+peer channel update -o orderer0.orgorderer1:7050 -c mychannel -f./channel-artifacts/Org2MSPanchors.tx
+peer chaincode install -n mycc -v 1.0 -p github.com/hyperledger/fabric/peer/channel-artifacts/chaincode
+peer chaincode query -C mychannel -n mycc -c '{"Args":["query","a"]}'
+
+在master上执行fabric-add-org脚本
+cd fabric-add-org
+./generateALL.sh
+python3 transform/run.py
+察看fabric创建情况
+kubectl get pod --all-namespaces
+
+export FABRIC_CFG_PATH=$PWD && configtxgen -printOrg Org3MSP > /opt/share/fabric/channel-artifacts/org3.json
+
+进入org1_cli
+export ORDERER_CA=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto-config/ordererOrganizations/orgorderer1/msp/cacerts/ca.orgorderer1-cert.pem  && export CHANNEL_NAME=mychannel
+echo $ORDERER_CA && echo $CHANNEL_NAME
+peer channel fetch config config_block.pb -o orderer0.orgorderer1:7050 -c $CHANNEL_NAME --cafile $ORDERER_CA
+configtxlator proto_decode --input config_block.pb --type common.Block | jq .data.data[0].payload.data.config > config.json
+jq -s '.[0] * {"channel_group":{"groups":{"Application":{"groups": {"Org3MSP":.[1]}}}}}' config.json ./channel-artifacts/org3.json > modified_config.json
+configtxlator proto_encode --input config.json --type common.Config --output config.pb
+configtxlator proto_encode --input modified_config.json --type common.Config --output modified_config.pb
+configtxlator compute_update --channel_id $CHANNEL_NAME --original config.pb --updated modified_config.pb --output org3_update.pb
+configtxlator proto_decode --input org3_update.pb --type common.ConfigUpdate | jq . > org3_update.json
+echo '{"payload":{"header":{"channel_header":{"channel_id":"mychannel", "type":2}},"data":{"config_update":'$(cat org3_update.json)'}}}' | jq . > org3_update_in_envelope.json
+configtxlator proto_encode --input org3_update_in_envelope.json --type common.Envelope --output org3_update_in_envelope.pb
+peer channel signconfigtx -f org3_update_in_envelope.pb
+
+进入org2_cli
+export ORDERER_CA=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto-config/ordererOrganizations/orgorderer1/msp/cacerts/ca.orgorderer1-cert.pem  && export CHANNEL_NAME=mychannel
+peer channel update -f org3_update_in_envelope.pb -c $CHANNEL_NAME -o orderer0.orgorderer1:7050 --cafile $ORDERER_CA
+
+进入org3_cli
+export ORDERER_CA=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto-config/ordererOrganizations/orgorderer1/msp/cacerts/ca.orgorderer1-cert.pem  && export CHANNEL_NAME=mychannel
+echo $ORDERER_CA && echo $CHANNEL_NAME
+peer channel fetch 0 mychannel.block -o orderer0.orgorderer1:7050 -c $CHANNEL_NAME --cafile $ORDERER_CA
+
+export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto-config/peerOrganizations/org3/peers/peer1.org3/tls/ca.crt && export CORE_PEER_ADDRESS=peer1.org3:7051
+
+peer channel join -b mychannel.block
+
+peer chaincode install -n mycc -v 1.0 -p github.com/hyperledger/fabric/peer/channel-artifacts/chaincode
+peer chaincode query -C mychannel -n mycc -c '{"Args":["query","a"]}'
